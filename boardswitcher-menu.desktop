@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=boardswitcher
+GenericName=Смена раскладки
+Comment=Смена раскладки слова и выделенного текста по Caps Lock
+Exec=/usr/bin/boardswitcher --no-tray
+Icon=input-keyboard
+Terminal=false
+StartupNotify=false
+Categories=Office;
+Keywords=раскладка;keyboard;layout;punto;caps;

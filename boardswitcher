@@ -1,0 +1,410 @@
+#!/usr/bin/python3
+# Copyright (c) 2026 Dmitrii Markov
+# SPDX-License-Identifier: MIT
+"""boardswitcher: минимальный аналог Punto Switcher для X11 (RedOS 8, KDE Plasma 5).
+
+Клавиша Caps Lock делает всё сама. В настройках клавиатуры системы у неё должно
+быть отключено штатное поведение: нужна опция caps:none, а grp:caps_toggle
+нужно убрать (иначе система и программа будут переключать раскладку вдвоём,
+а Caps Lock будет включать заглавные):
+  * если только что набрано слово (после него не было клика мышью,
+    стрелок, Enter) - меняется раскладка этого слова;
+  * иначе - раскладка выделенного текста (в любом приложении);
+  * если нет ни слова, ни выделения (или выделены только пробелы и переводы
+    строки) - ничего не вставляется, просто переключается раскладка.
+После конвертации раскладка системы ставится в ту, в которой теперь текст.
+Повторное нажатие возвращает слово обратно. В смешанном выделении
+конвертируется преобладающая раскладка, остальное остаётся как есть.
+
+Зависимости: python3-xlib, xclip; значок в трее - python3-qt5 (необязательно).
+Ключи запуска: --debug (подробный вывод), --no-tray (без значка).
+"""
+import ctypes
+import ctypes.util
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+from Xlib import X, display
+from Xlib.ext import record, xtest
+from Xlib.protocol import rq
+
+try:
+    from PyQt5 import QtGui, QtWidgets
+except ImportError:
+    QtGui = QtWidgets = None
+
+DEBUG = "--debug" in sys.argv
+NO_TRAY = "--no-tray" in sys.argv
+
+# Физический код клавиши Caps Lock (в X11 с evdev - 66). По коду, а не по символу:
+# при grp:caps_toggle на этой клавише висит не Caps_Lock, а переключатель групп.
+CAPS_KEYCODE = 66
+XKB_USE_CORE_KBD = 0x0100
+KS_BACKSPACE = 0xFF08
+KS_RETURN = 0xFF0D
+KS_KP_ENTER = 0xFF8D
+KS_INSERT = 0xFF63
+KS_SHIFT_L = 0xFFE1
+KS_CONTROL_L = 0xFFE3
+KS_SPACE = 0x20
+
+# Модификаторы и "служебные" клавиши: сами по себе слово не прерывают
+MODIFIER_KEYSYMS = set(range(0xFFE1, 0xFFEF)) | {0xFF7E, 0xFF7F} | set(range(0xFE01, 0xFE14))
+
+# (маска, keysym'ы клавиш) - что отпустить перед вводом, если зажато физически
+HELD_MODS = [
+    (X.ShiftMask, (0xFFE1, 0xFFE2)),
+    (X.ControlMask, (0xFFE3, 0xFFE4)),
+    (X.Mod1Mask, (0xFFE9, 0xFFEA)),
+    (X.Mod4Mask, (0xFFEB, 0xFFEC)),
+]
+
+
+def log(*args):
+    if DEBUG:
+        print(*args, flush=True)
+
+
+def keysym_char(ks):
+    """keysym -> символ ('' если клавиша не печатает символ)."""
+    if ks == 0:
+        return ""
+    if 0x20 <= ks <= 0x7E or 0xA0 <= ks <= 0xFF:
+        return chr(ks)
+    if ks & 0xFF000000 == 0x01000000:
+        return chr(ks & 0xFFFFFF)
+    if 0x6A1 <= ks <= 0x6FF:  # кириллические keysym'ы идут в порядке KOI8
+        try:
+            return bytes([ks - 0x600]).decode("koi8-u")
+        except UnicodeDecodeError:
+            return ""
+    return ""
+
+
+def xclip_get(sel):
+    try:
+        r = subprocess.run(["xclip", "-o", "-selection", sel],
+                           capture_output=True, timeout=1)
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def xclip_put(sel, text):
+    try:
+        subprocess.run(["xclip", "-i", "-selection", sel],
+                       input=text.encode("utf-8"), timeout=2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def layout_names():
+    try:
+        out = subprocess.run(["setxkbmap", "-query"], capture_output=True,
+                             text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if line.startswith("layout:"):
+                return [x.strip() for x in line.split(":", 1)[1].split(",")]
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return ["?", "?"]
+
+
+class Punto:
+    def __init__(self):
+        self.d = display.Display()    # XTest и чтение раскладки
+        self.rec = display.Display()  # отдельное соединение под XRecord
+        for ext in ("RECORD", "XTEST"):
+            if not self.d.has_extension(ext):
+                sys.exit("Нет расширения X11 %s. Это точно X11-сессия?" % ext)
+        self.names = layout_names()
+        self.map_a, self.map_b = self.build_maps()
+        self.word = []    # [(keycode, level, group)] - текущее слово
+        self.trail = 0    # сколько пробелов набрано после слова
+        self.ignore = False
+        self.enabled = True
+        self.xkb = None   # (libX11, Display*) для переключения раскладки
+
+    def set_enabled(self, value):
+        self.enabled = bool(value)
+        self.clear()
+
+    # ---------- раскладки ----------
+    def build_maps(self):
+        """Таблицы символов раскладка0 -> раскладка1 и обратно из keymap X-сервера."""
+        a2b, b2a = {}, {}
+        for kc in range(8, 256):
+            for lvl in (0, 1):
+                a = keysym_char(self.d.keycode_to_keysym(kc, lvl))
+                b = keysym_char(self.d.keycode_to_keysym(kc, 2 + lvl))
+                if a and b:
+                    a2b.setdefault(a, b)
+                    b2a.setdefault(b, a)
+        return a2b, b2a
+
+    def char_for(self, kc, group, level):
+        return keysym_char(self.d.keycode_to_keysym(kc, group * 2 + int(level)))
+
+    def convert_text(self, text, cur_group):
+        """-> (новый текст, группа, в которую превратился текст)."""
+        na = sum(1 for c in text if c.isalpha() and self.map_a.get(c, c) != c)
+        nb = sum(1 for c in text if c.isalpha() and self.map_b.get(c, c) != c)
+        if na == nb:
+            src = cur_group if cur_group in (0, 1) else 0
+        else:
+            src = 0 if na > nb else 1
+        table = self.map_a if src == 0 else self.map_b
+        return "".join(table.get(c, c) for c in text), 1 - src
+
+    def lock_group(self, group):
+        """Поставить раскладку системы (0 - первая, 1 - вторая). Работает как Alt+Shift."""
+        try:
+            if self.xkb is None:
+                lib = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+                lib.XOpenDisplay.restype = ctypes.c_void_p
+                lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                lib.XkbUseExtension.argtypes = [ctypes.c_void_p,
+                                                ctypes.POINTER(ctypes.c_int),
+                                                ctypes.POINTER(ctypes.c_int)]
+                lib.XkbLockGroup.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+                lib.XFlush.argtypes = [ctypes.c_void_p]
+                dpy = lib.XOpenDisplay(None)
+                if not dpy:
+                    raise RuntimeError("не удалось открыть дисплей")
+                lib.XkbUseExtension(dpy, ctypes.byref(ctypes.c_int(1)),
+                                    ctypes.byref(ctypes.c_int(0)))
+                self.xkb = (lib, dpy)
+            lib, dpy = self.xkb
+            lib.XkbLockGroup(dpy, XKB_USE_CORE_KBD, group)
+            lib.XFlush(dpy)
+        except Exception as e:
+            print("Не удалось переключить раскладку:", e, file=sys.stderr, flush=True)
+
+    # ---------- ввод клавиш ----------
+    def tap(self, keysym, mods=()):
+        kc = self.d.keysym_to_keycode(keysym)
+        mkc = [self.d.keysym_to_keycode(m) for m in mods]
+        if not kc:
+            return
+        for m in mkc:
+            xtest.fake_input(self.d, X.KeyPress, m)
+        xtest.fake_input(self.d, X.KeyPress, kc)
+        xtest.fake_input(self.d, X.KeyRelease, kc)
+        for m in reversed(mkc):
+            xtest.fake_input(self.d, X.KeyRelease, m)
+        self.d.sync()
+
+    def release_held_mods(self):
+        mask = self.d.screen().root.query_pointer().mask
+        for bit, keysyms in HELD_MODS:
+            if mask & bit:
+                for ks in keysyms:
+                    kc = self.d.keysym_to_keycode(ks)
+                    if kc:
+                        xtest.fake_input(self.d, X.KeyRelease, kc)
+        self.d.sync()
+
+    def paste(self, text):
+        xclip_put("clipboard", text)
+        xclip_put("primary", text)
+        self.tap(KS_INSERT, [KS_SHIFT_L])  # Shift+Insert не зависит от раскладки
+        time.sleep(0.15)
+
+    # ---------- действия ----------
+    def do_word(self, word, trail):
+        src = word[-1][2]          # в какой раскладке слово набрано (по последней клавише)
+        tgt = 1 - src
+        new = "".join(self.char_for(kc, tgt, lvl) or self.char_for(kc, src, lvl)
+                      for kc, lvl, _ in word) + " " * trail
+        log("слово:", len(word), "->", repr(new))
+        old = xclip_get("clipboard")
+        for _ in range(len(word) + trail):
+            self.tap(KS_BACKSPACE)
+            time.sleep(0.004)
+        self.paste(new)
+        self.lock_group(tgt)
+        time.sleep(0.3)
+        xclip_put("clipboard", old)
+        # теперь слово "живёт" в другой раскладке: повторное нажатие вернёт его назад
+        self.word = [(kc, lvl, tgt) for kc, lvl, _ in word]
+
+    def do_selection(self, group):
+        old = xclip_get("clipboard")
+        sentinel = "boardswitcher-sentinel-%f" % time.time()
+        xclip_put("clipboard", sentinel)
+        self.tap(KS_INSERT, [KS_CONTROL_L])  # Ctrl+Insert = копировать в любой раскладке
+        text = ""
+        for _ in range(12):
+            time.sleep(0.05)
+            t = xclip_get("clipboard")
+            if t and t != sentinel:
+                text = t
+                break
+        if not text.strip():
+            log("нет ни слова, ни выделения - просто переключаю раскладку")
+            xclip_put("clipboard", old)
+            self.lock_group(1 - (group if group in (0, 1) else 0))
+            return
+        new, tgt = self.convert_text(text, group)
+        log("выделение:", repr(text), "->", repr(new))
+        self.paste(new)
+        self.lock_group(tgt)
+        time.sleep(0.3)
+        xclip_put("clipboard", old)
+
+    def worker(self, group, word, trail):
+        try:
+            self.release_held_mods()
+            if word:
+                self.do_word(word, trail)
+            else:
+                self.do_selection(group)
+        except Exception as e:  # не даём демону умереть
+            print("Ошибка:", e, file=sys.stderr, flush=True)
+        finally:
+            time.sleep(0.3)  # пока события от наших же нажатий дойдут и будут отброшены
+            self.ignore = False
+
+    # ---------- слежение за клавиатурой ----------
+    def clear(self):
+        self.word = []
+        self.trail = 0
+
+    def on_key(self, kc, state):
+        group = (state >> 13) & 3
+        ks0 = self.d.keycode_to_keysym(kc, 0)
+
+        if kc == CAPS_KEYCODE:
+            if self.ignore or not self.enabled:
+                return
+            self.ignore = True
+            threading.Thread(target=self.worker, daemon=True,
+                             args=(group, list(self.word), self.trail)).start()
+            return
+
+        if self.ignore or not self.enabled or ks0 in MODIFIER_KEYSYMS:
+            return
+        if state & (X.ControlMask | X.Mod1Mask | X.Mod4Mask) or group not in (0, 1):
+            self.clear()
+            return
+
+        ks = self.d.keycode_to_keysym(kc, group * 2)
+        if ks == KS_BACKSPACE:
+            if self.trail:
+                self.trail -= 1
+            elif self.word:
+                self.word.pop()
+            return
+        if ks in (KS_RETURN, KS_KP_ENTER):
+            self.clear()
+            return
+        if ks == KS_SPACE:
+            if self.word:
+                self.trail += 1
+            return
+        ch = keysym_char(ks)
+        if not ch:
+            self.clear()  # стрелки, Tab, Esc, F-клавиши и т.п.
+            return
+        level = bool(state & X.ShiftMask)
+        if state & X.LockMask and ch.isalpha():
+            level = not level
+        if self.trail:  # после пробела начинается новое слово
+            self.word = []
+            self.trail = 0
+        self.word.append((kc, level, group))
+        if len(self.word) > 200:
+            self.clear()
+
+    def callback(self, reply):
+        if reply.category != record.FromServer or reply.client_swapped:
+            return
+        data = reply.data
+        if not len(data) or data[0] < 2:
+            return
+        while len(data):
+            ev, data = rq.EventField(None).parse_binary_value(
+                data, self.rec.display, None, None)
+            if ev.type == X.KeyPress:
+                self.on_key(ev.detail, ev.state)
+            elif ev.type == X.ButtonPress and ev.detail <= 3:
+                if not self.ignore:
+                    self.clear()
+
+    def loop(self):
+        try:
+            ctx = self.rec.record_create_context(0, [record.AllClients], [{
+                "core_requests": (0, 0), "core_replies": (0, 0),
+                "ext_requests": (0, 0, 0, 0), "ext_replies": (0, 0, 0, 0),
+                "delivered_events": (0, 0),
+                "device_events": (X.KeyPress, X.ButtonPress),
+                "errors": (0, 0), "client_started": False, "client_died": False,
+            }])
+            self.rec.record_enable_context(ctx, self.callback)
+            self.rec.record_free_context(ctx)
+        except Exception as e:
+            print("Слежение за клавиатурой остановилось:", e, file=sys.stderr, flush=True)
+            os._exit(1)
+
+
+def run_tray(app):
+    """Значок в трее: включить/выключить и выход. Блокируется до выхода."""
+    qt = QtWidgets.QApplication(sys.argv[:1])
+    qt.setQuitOnLastWindowClosed(False)
+    icon = QtGui.QIcon.fromTheme("input-keyboard")
+    if icon.isNull():
+        icon = qt.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
+    tray = QtWidgets.QSystemTrayIcon(icon)
+    menu = QtWidgets.QMenu()
+    toggle = menu.addAction("Включено")
+    toggle.setCheckable(True)
+    toggle.setChecked(True)
+
+    def on_toggle(value):
+        app.set_enabled(value)
+        tray.setToolTip("boardswitcher: " + ("включён" if value else "выключен"))
+
+    toggle.toggled.connect(on_toggle)
+    menu.addSeparator()
+    menu.addAction("Выход").triggered.connect(qt.quit)
+    tray.setContextMenu(menu)
+    tray.setToolTip("boardswitcher: включён (Caps Lock)")  # клавиша - Caps Lock
+    tray.show()
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    qt.exec_()
+
+
+def main():
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        print("Внимание: сессия Wayland, программа работает только в X11", file=sys.stderr)
+    lock_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    lock = open(os.path.join(lock_dir, "boardswitcher.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("boardswitcher уже запущен")
+        return
+    app = Punto()
+    print("boardswitcher запущен. Раскладки: %s. Клавиша: Caps Lock"
+          % ",".join(app.names), flush=True)
+    worker = threading.Thread(target=app.loop, daemon=True)
+    worker.start()
+    if QtWidgets and not NO_TRAY:
+        run_tray(app)
+    else:
+        if not NO_TRAY:
+            print("PyQt5 не найден, работаю без значка в трее", file=sys.stderr)
+        try:
+            worker.join()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()
