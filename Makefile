@@ -1,5 +1,5 @@
 NAME    = boardswitcher
-VERSION = 1.0
+VERSION = 1.1
 FILES   = boardswitcher boardswitcher.desktop boardswitcher-menu.desktop \
           boardswitcher.spec LICENSE README.md Makefile .gitignore
 

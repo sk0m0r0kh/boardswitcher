@@ -3,8 +3,8 @@
 %define _source_payload w9.gzdio
 
 Name:           boardswitcher
-Version:        1.0
-Release:        5%{?dist}
+Version:        1.1
+Release:        1%{?dist}
 Summary:        Layout switcher for the last typed word and selected text (Caps Lock)
 License:        MIT
 BuildArch:      noarch
@@ -20,8 +20,8 @@ Suggests:       python3-qt5
 Minimal Punto Switcher analogue for X11 (KDE Plasma 5). Caps Lock converts the
 last typed word, or the selected text, to the other keyboard layout and sets the
 system layout accordingly. Started automatically at KDE login as the user.
-The system keyboard settings must have caps:none and must not have
-grp:caps_toggle (see the README).
+The Caps Lock state is cleared by the program itself. The system keyboard
+settings must not have grp:caps_toggle (see the README).
 
 %prep
 %setup -q
@@ -42,6 +42,9 @@ install -Dm0644 boardswitcher-menu.desktop %{buildroot}%{_datadir}/applications/
 %{_datadir}/applications/boardswitcher.desktop
 
 %changelog
+* Wed Oct 28 2026 Dmitrii Markov <skomoroker@gmail.com> - 1.1-1
+- The program now clears the Caps Lock state itself (XkbLockModifiers); caps:none in system settings is no longer required
+
 * Wed Oct 21 2026 Dmitrii Markov <skomoroker@gmail.com> - 1.0-5
 - Add LICENSE (MIT) and README; set author
 
