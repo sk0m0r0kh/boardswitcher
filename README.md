@@ -4,6 +4,10 @@
 раскладку последнего набранного слова или выделенного текста («ghbdtn» ↔ «привет»)
 и сразу переключает раскладку системы. Минимальный аналог Punto Switcher.
 
+> **Windows:** есть отдельная версия для Windows 10/11 с установщиком, окном настроек и режимом
+> работы в окнах администратора. Описание и сборка — в [windows/README.md](windows/README.md),
+> готовый установщик — в [релизах](https://github.com/sk0m0r0kh/boardswitcher/releases).
+
 > **Статус: личный инструмент, публикуется «как есть».** Написана для одного
 > конкретного окружения (RedOS 8, KDE Plasma 5, X11, две раскладки us/ru) и
 > проверена в основном там. Автоматических тестов нет. Подробности и ограничения
@@ -265,4 +269,7 @@ with no word and no selection it simply toggles the layout.
   no automated tests, tested manually in one environment.
 - **Provenance:** written with the help of an AI assistant (Claude, by Anthropic) to the author's requirements;
   please read the single-file source before relying on it.
+- **Windows:** a separate Windows 10/11 version (C# / .NET 10, installer, settings window, optional
+  elevated mode for administrator windows) lives in [windows/](windows/README.md); installers are on the
+  [Releases](https://github.com/sk0m0r0kh/boardswitcher/releases) page.
 - **License:** MIT. Not affiliated with Punto Switcher or its owner.
