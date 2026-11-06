@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>boardswitcher</AssemblyName>
+    <RootNamespace>BoardSwitcher</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Version>1.2.0</Version>
+    <ApplicationIcon>boardswitcher.ico</ApplicationIcon>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <!-- Безопасность: не загружать код из переменной окружения DOTNET_STARTUP_HOOKS
+         (программа может работать с правами администратора). -->
+    <StartupHookSupport>false</StartupHookSupport>
+    <Product>boardswitcher</Product>
+    <Description>Минимальный аналог Punto Switcher для Windows: Caps Lock меняет раскладку слова или выделения</Description>
+    <Copyright>Copyright (c) 2026 Dmitrii Markov</Copyright>
+  </PropertyGroup>
+
+</Project>
